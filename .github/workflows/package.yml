@@ -1,0 +1,168 @@
+name: Package
+
+# Builds the desktop installers. Modeled on Deep Face Cam's package-macos.yml /
+# package-windows.yml. Outputs go to a draft GitHub release (private repo
+# artifact storage is too small for ~1-2 GB installers).
+#   macOS:   unsigned .app (tar.gz) per architecture; sign, DMG and notarize locally
+#            with packaging/macos/build_app.py import|sign|dmg|notarize.
+#   Windows: CPU -> unsigned MSI; NVIDIA CUDA -> portable 7z (torch CUDA alone is
+#            ~1.9 GB, beyond the 2 GB MSI/NSIS limit), split below 2 GB per file.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag for the installers
+        required: true
+        default: builds-0.3.0
+      platforms:
+        description: Which installers to build
+        type: choice
+        default: all
+        options: [all, macos, windows]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ inputs.tag }}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "${{ inputs.tag }}" -R "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+              --title "Installers ${{ inputs.tag }}" --notes "Build ${{ github.run_id }} from ${{ github.sha }}"
+
+  macos:
+    name: macOS (${{ matrix.arch }})
+    needs: release
+    if: inputs.platforms != 'windows'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x64
+            runner: macos-15-intel
+    env:
+      VISOMASTER_ARCH: ${{ matrix.arch }}
+      VISOMASTER_RELEASES: ${{ github.workspace }}/../releases
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: studio-ui/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Runner details
+        run: sw_vers; uname -m; python --version; node --version; rustc --version
+      - name: Backend (standalone Python, requirements, FFmpeg) and smoke test
+        run: python packaging/backend.py macos-${{ matrix.arch }} --smoke
+      - run: pnpm install --frozen-lockfile
+        working-directory: studio-ui
+      - name: Build app and add the backend
+        run: python packaging/macos/build_app.py app
+      - name: Package unsigned app
+        id: pack
+        run: |
+          VERSION=$(node -p "require('./studio-ui/src-tauri/tauri.conf.json').version")
+          OUT="VisoMaster-Studio-$VERSION-macOS-${{ matrix.arch }}-unsigned.app.tar.gz"
+          tar -czf "$OUT" -C "$VISOMASTER_RELEASES/macos-$VERSION-${{ matrix.arch }}" "VisoMaster Studio.app"
+          shasum -a 256 "$OUT" > "$OUT.sha256"
+          ls -l "$OUT"
+          echo "files=$OUT $OUT.sha256" >> "$GITHUB_OUTPUT"
+      - name: Upload to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.tag }}" ${{ steps.pack.outputs.files }} --clobber
+
+  windows:
+    name: Windows (${{ matrix.name }})
+    needs: release
+    if: inputs.platforms != 'macos'
+    runs-on: windows-2025
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: CPU
+            variant: cpu
+            suffix: CPU
+          - name: NVIDIA CUDA
+            variant: cuda
+            suffix: NVIDIA-CUDA
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: studio-ui/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Runner details
+        shell: pwsh
+        run: |
+          systeminfo | Select-String "OS Name","OS Version","System Type"
+          python --version; node --version; rustc --version
+          Get-PSDrive C | Select-Object Used,Free
+      - name: Backend (standalone Python, requirements, FFmpeg) and smoke test
+        run: python packaging/backend.py windows-${{ matrix.variant }} --smoke
+      - run: pnpm install --frozen-lockfile
+        working-directory: studio-ui
+      - name: Build MSI installer
+        if: matrix.variant == 'cpu'
+        working-directory: studio-ui
+        run: pnpm tauri build --bundles msi
+      - name: Build portable app
+        if: matrix.variant == 'cuda'
+        working-directory: studio-ui
+        run: pnpm tauri build --no-bundle
+      - name: Collect release files
+        id: pack
+        shell: pwsh
+        run: |
+          $version = node -p "require('./studio-ui/src-tauri/tauri.conf.json').version"
+          $name = "VisoMaster-Studio-$version-Windows-x64-${{ matrix.suffix }}"
+          New-Item -ItemType Directory -Force out | Out-Null
+          if ("${{ matrix.variant }}" -eq "cpu") {
+            $msi = Get-ChildItem studio-ui/src-tauri/target/release/bundle/msi/*.msi | Select-Object -First 1
+            Copy-Item $msi.FullName "out/$name.msi"
+          } else {
+            $stage = "stage/VisoMaster Studio"
+            New-Item -ItemType Directory -Force $stage | Out-Null
+            Copy-Item studio-ui/src-tauri/target/release/visomaster-studio.exe "$stage/VisoMaster Studio.exe"
+            Copy-Item -Recurse studio-ui/src-tauri/generated/backend "$stage/backend"
+            Copy-Item LICENSE "$stage/LICENSE.txt"
+            7z a -t7z -mx=7 -v1900m "out/$name-portable.7z" "./stage/VisoMaster Studio" | Out-Null
+          }
+          $sums = Get-ChildItem out -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          }
+          # LF endings so `shasum -c` works on macOS/Linux too.
+          [IO.File]::WriteAllText("$PWD/out/$name.sha256", (($sums -join "`n") + "`n"))
+          Get-ChildItem out | Format-Table Name,Length
+      - name: Upload to draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.tag }}" (Get-ChildItem out -File).FullName --clobber

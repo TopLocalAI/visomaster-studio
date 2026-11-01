@@ -1,0 +1,68 @@
+# This file configures the uv tool to find packages in special indexes.
+# It uses the preferred tool.uv.pip.extra-index-url format for multiple indices.
+
+[tool.uv.pip]
+index-strategy = "unsafe-best-match"
+extra-index-url = [
+    "https://pypi.nvidia.com",
+    "https://download.pytorch.org/whl/cu130",
+    "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/",
+    "https://pypi.org/simple"
+]
+
+[tool.mypy]
+python_version = "3.12"
+
+# --- Crash prevention ---------------------------------------------------------
+# The mypy pre-commit hook runs in an isolated venv that does not have torch,
+# PySide6, kornia, or any other heavy dependency installed.  Without these two
+# settings mypy follows every import recursively and eventually crashes on
+# Windows with exit code 0xC0000005 (stack overflow / access violation).
+ignore_missing_imports = true
+follow_imports = "silent"
+
+# --- Scope --------------------------------------------------------------------
+# Skip directories that are either generated code, external vendored code, or
+# otherwise not subject to type-checking in this project.
+exclude = [
+    "app/processors/external/",   # vendored third-party code
+    "app/ui/core/media_rc\\.py",  # auto-generated Qt resource file
+    "app/ui/core/main_window\\.py",
+    "custom_kernels/",            # standalone benchmark/utility scripts, not app code
+]
+
+# Per-module overrides for packages that ship no stubs and are heavy to analyse.
+# "skip" means mypy will not try to analyse the package's own source at all,
+# preventing recursive import traversal into torch / PySide6 / etc.
+[[tool.mypy.overrides]]
+module = [
+    "torch.*",
+    "torchvision.*",
+    "PySide6.*",
+    "kornia.*",
+    "cv2.*",
+    "skimage.*",
+    "onnxruntime.*",
+    "insightface.*",
+    "send2trash.*",
+    "qdarkstyle.*",
+    "qdarktheme.*",
+    "pyqttoast.*",
+    "numpy.*",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.ruff.lint]
+# benchmark scripts have a mandatory TensorRT DLL-path setup block before imports
+per-file-ignores = { "custom_kernels/**/benchmark_*.py" = ["E402"], "custom_kernels/run_all_benchmarks.py" = ["E402"] }
+
+[tool.pytest.ini_options]
+testpaths  = ["tests"]
+addopts    = "-ra -q --tb=short"
+markers    = [
+    "slow: tests that take > 2 s (deselect with -m 'not slow')",
+    "gpu:  tests requiring a CUDA device",
+    "qt:   tests requiring a Qt application instance",
+    "integration: integration tests requiring GPU + model files",
+]

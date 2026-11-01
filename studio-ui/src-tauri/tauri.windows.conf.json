@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["msi"],
+    "resources": { "generated/backend/": "backend/" },
+    "windows": {
+      "wix": { "language": ["en-US", "zh-CN"] },
+      "webviewInstallMode": { "type": "downloadBootstrapper" }
+    }
+  }
+}
